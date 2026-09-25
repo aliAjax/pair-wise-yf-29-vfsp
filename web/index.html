@@ -1,4 +1,93 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>法律证据保管</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,input,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>法律证据保管与流转</h1><div class="panel"><select id="user"><option>custodian1</option><option>custodian2</option><option>analyst1</option><option>auditor1</option><option>outsider</option></select><input id="case" value="1"><button onclick="load()">生成保管报告</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch(`/api/cases/${case.value}/report`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<style>
+body{font:15px system-ui;max-width:1060px;margin:28px auto;padding:0 16px;color:#1a1a1a}
+select,input,button,textarea{padding:7px;margin:3px;font:inherit}
+button{cursor:pointer}
+pre{background:#f5f5f5;padding:12px;white-space:pre-wrap;border-radius:6px}
+.panel{border:1px solid #bbb;padding:14px;border-radius:8px;margin-bottom:16px}
+.ev{border:1px solid #ccc;border-radius:8px;padding:12px;margin:10px 0}
+.ev h3{margin:0 0 6px}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;margin-left:6px;color:#fff;background:#777}
+.tag.pending{background:#b58105}.tag.destroyed{background:#a8071a}.tag.approved{background:#a8071a}
+.tag.rejected{background:#8c8c8c}.tag.withdrawn{background:#595959}.tag.expired{background:#096dd9}
+.tag.hold{background:#d4380d}.tag.ok{background:#389e0d}
+table{border-collapse:collapse;width:100%;margin-top:6px;font-size:13px}
+td,th{border:1px solid #ddd;padding:4px 7px;text-align:left}
+.muted{color:#666;font-size:13px}
+</style></head>
+<body>
+<h1>法律证据保管与流转</h1>
+<div class="panel">
+  身份 <select id="user">
+    <option>custodian1</option><option>custodian2</option>
+    <option>analyst1</option><option>auditor1</option><option>auditor2</option><option>outsider</option>
+  </select>
+  案件 <input id="case" value="1" style="width:60px">
+  <button onclick="load()">生成保管报告</button>
+  <span class="muted">保留期满后由保管员发起销毁申请，由案件内另一名审计员复核（发起人不能自审）。</span>
+</div>
+<div id="list"></div>
+<pre id="out" hidden></pre>
+<script>
+const $=id=>document.getElementById(id);
+async function api(path,method="GET",data){
+  const r=await fetch(path,{method,headers:{"X-User-Id":$("user").value,"Content-Type":"application/json"},body:data?JSON.stringify(data):undefined});
+  return {status:r.status,body:await r.json()};
+}
+async function load(){
+  const {status,body}=await api(`/api/cases/${$("case").value}/report`);
+  if(status!==200){$("out").hidden=false;$("out").textContent=JSON.stringify(body,null,2);$("list").innerHTML="";return}
+  $("out").hidden=true;
+  $("list").innerHTML = `<div class="panel"><h2 style="margin-top:0">${body.case.title} <span class="muted">${body.case.case_number}</span></h2>
+    <div class="muted">证据 ${body.evidence_count} 件 · 完整性总体 ${body.overall_integrity_valid?"有效":"异常"} · 生成于 ${body.generated_at}</div>
+    ${body.evidence.map(renderEvidence).join("")}
+    ${renderRequests(body.destruction_requests)}
+  </div>`;
+}
+function esc(s){return String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
+function renderEvidence(e){
+  const tags=[];
+  tags.push(`<span class="tag ${e.status==="destroyed"?"destroyed":"ok"}">${({custody:"封存",opened:"已开箱",released:"已释放",derivative:"衍生件",destroyed:"已销毁"})[e.status]}</span>`);
+  if(e.legal_hold)tags.push(`<span class="tag hold">法律保留</span>`);
+  if(e.retention_expired&&e.status!=="destroyed")tags.push(`<span class="tag expired">保留期满</span>`);
+  const pending=e.destruction_requests.find(r=>r.status==="pending");
+  if(pending)tags.push(`<span class="tag pending">销毁待复核 #${pending.id}</span>`);
+  const reqRows=e.destruction_requests.map(r=>`<tr>
+      <td>#${r.id}</td><td>${({pending:"待复核",approved:"已同意-销毁",rejected:"已驳回",withdrawn:"已撤下"})[r.status]}</td>
+      <td>${esc(r.requested_by)}</td><td>${esc(r.reviewed_by||"")}</td><td>${esc(r.review_note||r.withdrawn_reason||"")}</td>
+    </tr>`).join("");
+  const canRequest=e.status!=="destroyed"&&e.status!=="released"&&e.retention_expired&&!e.legal_hold&&!pending;
+  return `<div class="ev" id="ev${e.id}">
+    <h3>#${e.id} ${esc(e.label)} <span class="muted">${esc(e.filename)}</span>${tags.join("")}</h3>
+    <div class="muted">SHA-256 ${e.sha256.slice(0,16)}… · 大小 ${e.size} · 保管人 ${esc(e.current_custodian)} · 保留至 ${e.retention_until} · 事件链 ${e.chain_valid?"完整":"异常"}${e.original_destroyed?" · 原件已销毁，元数据与事件链保留":""}</div>
+    ${e.destruction_requests.length?`<table><tr><th>申请</th><th>结论</th><th>发起人</th><th>复核人</th><th>意见</th></tr>${reqRows}</table>`:""}
+    ${canRequest?`<div>申请理由 <input id="reason${e.id}" placeholder="保留期届满，申请销毁原件" style="width:300px">
+      <button onclick="requestDestroy(${e.id})">发起销毁申请</button></div>`:""}
+    ${pending?`<div>复核意见 <input id="note${pending.id}" placeholder="同意/驳回意见" style="width:300px">
+      <button onclick="review(${pending.id},true)">同意销毁</button>
+      <button onclick="review(${pending.id},false)">驳回</button>
+      <span class="muted">待复核期间仅暂停释放，仍可查看、开箱、移交；发起人不能自审。</span></div>`:""}
+  </div>`;
+}
+function renderRequests(reqs){
+  if(!reqs||!reqs.length)return "";
+  return `<h3>销毁复核记录（报告）</h3><table><tr><th>申请</th><th>证据</th><th>结论</th><th>发起人</th><th>复核人</th><th>理由/意见</th></tr>
+    ${reqs.map(r=>`<tr><td>#${r.id}</td><td>#${r.evidence_id}</td>
+      <td>${({pending:"待复核",approved:"已同意-销毁",rejected:"已驳回",withdrawn:"因新设法律保留撤下"})[r.status]}</td>
+      <td>${esc(r.requested_by)}</td><td>${esc(r.reviewed_by||"")}</td>
+      <td>${esc(r.reason)} ${esc(r.review_note?("｜"+r.review_note):"")} ${esc(r.withdrawn_reason?("｜"+r.withdrawn_reason):"")}</td></tr>`).join("")}
+    </table>`;
+}
+async function requestDestroy(id){
+  const reason=$("reason"+id).value.trim();
+  const {status,body}=await api(`/api/evidence/${id}/destruction-request`,"POST",{reason});
+  if(status>=400)return alert(body.error.message);
+  load();
+}
+async function review(id,approve){
+  const note=$("note"+id).value.trim();
+  const {status,body}=await api(`/api/destruction-requests/${id}`,"POST",{approve,note});
+  if(status>=400)return alert(body.error.message);
+  load();
+}
+</script></body></html>
